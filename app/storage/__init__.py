@@ -9,7 +9,18 @@
 
 from __future__ import annotations
 
-from .db import DEFAULT_DB_PATH, DB_PATH_ENV, SCHEMA_VERSION, SchemaVersionError, resolve_db_path
+from .db import (
+    CONFIG_FILENAME,
+    DATA_DIR_NAME,
+    DB_PATH_ENV,
+    DEFAULT_DB_PATH,
+    PROJECT_ROOT,
+    SCHEMA_VERSION,
+    SchemaVersionError,
+    StorageConfigError,
+    config_path,
+    resolve_db_path,
+)
 from .store import (
     AUDIT_KEEP,
     AuditRecord,
@@ -21,8 +32,11 @@ from .store import (
 
 __all__ = [
     "AUDIT_KEEP",
+    "CONFIG_FILENAME",
+    "DATA_DIR_NAME",
     "DB_PATH_ENV",
     "DEFAULT_DB_PATH",
+    "PROJECT_ROOT",
     "SCHEMA_VERSION",
     "AuditRecord",
     "DiffEntry",
@@ -30,5 +44,7 @@ __all__ = [
     "ProfileStoreError",
     "ProfileValidationError",
     "SchemaVersionError",
+    "StorageConfigError",
+    "config_path",
     "resolve_db_path",
 ]

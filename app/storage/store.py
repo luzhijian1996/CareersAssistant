@@ -13,6 +13,9 @@
    时间戳一被伪造，last-write-wins 的先后判定就失真了。
 4. **`skills[].evidence` 必须指向已存在的经历 / 项目 id**，否则拒绝写入。
    确实需要乱序写入（先建技能占位再补条目）时传 `check_evidence=False`。
+5. **条目采用软删除。** `delete_*` 只打退役标记（行保留、可 `restore_*`），画像及其引用一律不动；
+   只有 `purge=True` 才真删行。原因：审计（`audit`）只覆盖 profile 文档，条目没历史可滚，
+   硬删就是永久丢失；且旧画像可能引用了已删条目，导致 `rollback` 被证据校验卡死。
 
 与其它层的分工：`app/tools` 负责 LLM 参数的宽容归一化，本层对未知字段零容忍。
 存储写坏了无法自愈，宁可抛错也不能静默丢弃。
@@ -97,7 +100,7 @@ class ProfileStore:
     def load_bundle(self) -> ProfileBundle:
         """一次取回画像 + 全部经历 + 全部项目。程序启动调这一个就够了。
 
-        库里没有画像行时返回默认空画像（`persisted=False`），不抛错：
+        只返回未退役的条目。库里没有画像行时返回默认空画像（`persisted=False`），不报错：
         首次运行是正常状态，不是异常。
         """
         with self._lock:
@@ -107,20 +110,8 @@ class ProfileStore:
                 if row is not None
                 else Profile()
             )
-            experiences = [
-                _validate(Experience, item["data"])
-                for item in self._conn.execute(
-                    "SELECT data FROM experience WHERE profile_id=? ORDER BY rowid",
-                    (self._profile_id,),
-                )
-            ]
-            projects = [
-                _validate(Project, item["data"])
-                for item in self._conn.execute(
-                    "SELECT data FROM project WHERE profile_id=? ORDER BY rowid",
-                    (self._profile_id,),
-                )
-            ]
+            experiences = self._fetch_entries("experience", Experience, "exp_id")
+            projects = self._fetch_entries("project", Project, "proj_id")
             return ProfileBundle(
                 profile=profile,
                 experiences=experiences,
@@ -255,46 +246,85 @@ class ProfileStore:
 
     # ------------------------------------------------------------------ 写：经历
 
-    def list_experiences(self) -> list[Experience]:
+    def list_experiences(self, *, include_retired: bool = False) -> list[Experience]:
+        """列出经历。默认不含已退役条目。"""
         with self._lock:
-            return [
-                _validate(Experience, item["data"])
-                for item in self._conn.execute(
-                    "SELECT data FROM experience WHERE profile_id=? ORDER BY rowid",
-                    (self._profile_id,),
-                )
-            ]
+            return self._fetch_entries("experience", Experience, "exp_id", include_retired=include_retired)
 
     def upsert_experience(self, item: Experience) -> Experience:
-        """新增或整体替换一段经历。`exp_id` 留空时自动生成。"""
+        """新增或整体替换一段经历。`exp_id` 留空时自动生成。
+
+        对已退役的 id 重复 upsert 等于把它救回来（编辑即复活）。
+        """
         return self._upsert_entry("experience", "exp_id", "exp", item)
 
-    def delete_experience(self, exp_id: str, *, force: bool = False) -> Profile | None:
-        """删除一段经历。
+    def delete_experience(
+        self, exp_id: str, *, force: bool = False, purge: bool = False
+    ) -> list[str]:
+        """退役一段经历（软删除）。返回因此失去支撑证据的技能名。
 
-        默认拒绝删除仍被 `skills[].evidence` 引用的经历，并把引用它的技能名报回去，
-        由用户裁决"是技能错了还是经历该删"。`force=True` 才连带剔除引用。
+        默认只打标记、行保留、可用 `restore_experience` 救回，画像及其引用不动。
+        仍被 `skills[].evidence` 引用时默认拒绝，由用户裁决“是技能错了还是经历该退”。
+        `purge=True` 是第二步：真删行（不可恢复），且会从画像里剔除引用。
         """
-        return self._delete_entry("experience", "exp_id", exp_id, force=force)
+        with self._lock:
+            if purge:
+                return self._purge_entry("experience", "exp_id", exp_id, force=force)
+            return self._retire_entry("experience", "exp_id", exp_id, force=force)
+
+    def restore_experience(self, exp_id: str) -> Experience | None:
+        """取消退役，把经历取回来。"""
+        return self._restore_entry("experience", "exp_id", exp_id, Experience)
 
     # ------------------------------------------------------------------ 写：项目
 
-    def list_projects(self) -> list[Project]:
+    def list_projects(self, *, include_retired: bool = False) -> list[Project]:
+        """列出项目。默认不含已退役条目。"""
         with self._lock:
-            return [
-                _validate(Project, item["data"])
-                for item in self._conn.execute(
-                    "SELECT data FROM project WHERE profile_id=? ORDER BY rowid",
-                    (self._profile_id,),
-                )
-            ]
+            return self._fetch_entries("project", Project, "proj_id", include_retired=include_retired)
 
     def upsert_project(self, item: Project) -> Project:
-        """新增或整体替换一个项目。`proj_id` 留空时自动生成。"""
+        """新增或整体替换一个项目。`proj_id` 留空时自动生成。编辑已退役条目即救回。"""
         return self._upsert_entry("project", "proj_id", "proj", item)
 
-    def delete_project(self, proj_id: str, *, force: bool = False) -> Profile | None:
-        return self._delete_entry("project", "proj_id", proj_id, force=force)
+    def delete_project(
+        self, proj_id: str, *, force: bool = False, purge: bool = False
+    ) -> list[str]:
+        """退役（软删除）或 purge 真删一个项目。语义同 `delete_experience`。"""
+        with self._lock:
+            if purge:
+                return self._purge_entry("project", "proj_id", proj_id, force=force)
+            return self._retire_entry("project", "proj_id", proj_id, force=force)
+
+    def restore_project(self, proj_id: str) -> Project | None:
+        """取消退役，把项目取回来。"""
+        return self._restore_entry("project", "proj_id", proj_id, Project)
+
+    # ------------------------------------------------------------------ 证据健康度
+
+    def evidence_issues(self) -> dict[str, list[str]]:
+        """报告画像里指向“已退役条目”与“不存在条目”的证据引用。
+
+        退役条目不算悬空（可随时 restore，回滚也不会以它为由被卡），但技能会因此
+        失去支撑证据，所以必须能被上层查见——confirm 阶段就该拿这个结果提示用户。
+        """
+        with self._lock:
+            row = self._fetch_profile_row()
+            if row is None:
+                return {"retired": [], "missing": []}
+            profile = _validate(Profile, row["data"])
+            active = self._entry_ids(include_retired=False)
+            known = self._entry_ids(include_retired=True)
+            retired: list[str] = []
+            missing: list[str] = []
+            for skill in profile.skills:
+                label = skill.name or "(未命名技能)"
+                for ref in skill.evidence:
+                    if ref not in known:
+                        missing.append(f"{label} → {ref}")
+                    elif ref not in active:
+                        retired.append(f"{label} → {ref}")
+            return {"retired": retired, "missing": missing}
 
     # ------------------------------------------------------------------ 内部
 
@@ -343,23 +373,64 @@ class ProfileStore:
             (self._profile_id, self._profile_id, AUDIT_KEEP),
         )
 
-    def _entry_ids(self) -> set[str]:
-        ids = {
-            str(item["exp_id"])
-            for item in self._conn.execute(
-                "SELECT exp_id FROM experience WHERE profile_id=?", (self._profile_id,)
-            )
-        }
-        ids |= {
-            str(item["proj_id"])
-            for item in self._conn.execute(
-                "SELECT proj_id FROM project WHERE profile_id=?", (self._profile_id,)
-            )
-        }
+    def _fetch_entries(
+        self, table: str, model_cls: type[Any], id_field: str, *, include_retired: bool = False
+    ) -> list[Any]:
+        """读条目列表。默认只给未退役的，保证 `load_bundle` 看到的总是“活着的台账”。
+
+        以主键列为准回填 id：正常写入时两者必然一致（`_upsert_entry` 先定 id 再落 JSON），
+        但存量库 / 手工导库可能 JSON 里 id 为空，不能让它变成“查不到 id 的幽灵条目”。
+        """
+        sql = f"SELECT {id_field}, data FROM {table} WHERE profile_id=?"
+        if not include_retired:
+            sql += " AND retired=0"
+        sql += " ORDER BY rowid"
+        entries: list[Any] = []
+        for item in self._conn.execute(sql, (self._profile_id,)):
+            entries.append(_reconcile(_validate(model_cls, item["data"]), id_field, str(item[id_field])))
+        return entries
+
+    def _fetch_entry_row(self, table: str, id_field: str, entry_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            f"SELECT data, retired FROM {table} WHERE {id_field}=? AND profile_id=?",
+            (entry_id, self._profile_id),
+        ).fetchone()
+
+    def _referencing_skills(self, entry_id: str) -> list[str]:
+        """当前画像里有哪些技能的证据指向这条条目。退役/删除前都要问一遍。"""
+        row = self._fetch_profile_row()
+        if row is None:
+            return []
+        profile = _validate(Profile, row["data"])
+        return [skill.name or "(未命名技能)" for skill in profile.skills if entry_id in skill.evidence]
+
+    def _set_retired(self, table: str, id_field: str, entry_id: str, *, retired: bool) -> None:
+        self._conn.execute(
+            f"UPDATE {table} SET retired=?, retired_at=? WHERE {id_field}=? AND profile_id=?",
+            (1 if retired else 0, utc_now() if retired else "", entry_id, self._profile_id),
+        )
+        self._conn.commit()
+
+    def _entry_ids(self, *, include_retired: bool = False) -> set[str]:
+        """可被 evidence 引用的 id 集合。
+
+        `include_retired=True` 用于证据校验：已退役的条目仍然可解析，所以不算悬空——
+        这样“删条目”不会连带把 `rollback` 卡死。对外可见集合（ProfileBundle.entry_ids）仍只含活跃条目。
+        """
+        ids: set[str] = set()
+        for table, id_field in (("experience", "exp_id"), ("project", "proj_id")):
+            sql = f"SELECT {id_field} FROM {table} WHERE profile_id=?"
+            if not include_retired:
+                sql += " AND retired=0"
+            ids |= {
+                str(item[id_field])
+                for item in self._conn.execute(sql, (self._profile_id,))
+            }
         return ids
 
     def _check_evidence(self, profile: Profile, *, context: str = "写入时") -> None:
-        known = self._entry_ids()
+        # 已退役条目视为“可解析”，仅真正不存在的 id 才拦截写入
+        known = self._entry_ids(include_retired=True)
         dangling = [
             f"{skill.name or '(未命名技能)'} → {ref}"
             for skill in profile.skills
@@ -385,46 +456,71 @@ class ProfileStore:
             self._conn.execute(
                 f"INSERT INTO {table}({id_field}, profile_id, data, updated_at) VALUES(?,?,?,?) "
                 f"ON CONFLICT({id_field}) DO UPDATE SET "
-                "data=excluded.data, updated_at=excluded.updated_at",
+                "data=excluded.data, updated_at=excluded.updated_at, "
+                # 编辑即复活：用户还能改就说明它不该停在退役列表里
+                "retired=0, retired_at=''",
                 (entry_id, self._profile_id, record.model_dump_json(), utc_now()),
             )
             self._conn.commit()
             return record
 
-    def _delete_entry(
-        self, table: str, id_field: str, entry_id: str, *, force: bool
-    ) -> Profile | None:
-        with self._lock:
-            existed = self._conn.execute(
-                f"SELECT 1 FROM {table} WHERE {id_field}=? AND profile_id=?",
-                (entry_id, self._profile_id),
-            ).fetchone()
-            if existed is None:
-                raise ProfileValidationError(f"{table} 中不存在条目 {entry_id}")
-
-            bundle = self.load_bundle()
-            referencing = bundle.skills_referencing(entry_id)
-            if referencing and not force:
-                raise ProfileValidationError(
-                    f"技能 {', '.join(referencing)} 的证据指向 {entry_id}，"
-                    "删除会留下悬空引用；确认无误再传 force=True"
-                )
-            self._conn.execute(
-                f"DELETE FROM {table} WHERE {id_field}=?", (entry_id,)
+    def _retire_entry(self, table: str, id_field: str, entry_id: str, *, force: bool) -> list[str]:
+        """软删除：只打退役标记，数据行保留，画像与引用一律不动。"""
+        row = self._fetch_entry_row(table, id_field, entry_id)
+        if row is None:
+            raise ProfileValidationError(f"{table} 中不存在条目 {entry_id}")
+        referencing = self._referencing_skills(entry_id)
+        if int(row["retired"]):
+            return referencing
+        if referencing and not force:
+            raise ProfileValidationError(
+                f"技能 {', '.join(referencing)} 的证据指向 {entry_id}。退役本身不动画像，"
+                "但这些技能会失去支撑证据（JD 匹配时按弱信号处理）；确认无误再传 force=True"
             )
-            if not referencing:
-                self._conn.commit()
-                return bundle.profile
+        self._set_retired(table, id_field, entry_id, retired=True)
+        return referencing
 
-            # 剔除引用后重新提交画像，顺带留一次审计
-            data = bundle.profile.model_dump()
+    def _purge_entry(self, table: str, id_field: str, entry_id: str, *, force: bool) -> list[str]:
+        """硬删除：行真的没了，不可恢复。必须先退役，两步之间给用户反悔机会。"""
+        row = self._fetch_entry_row(table, id_field, entry_id)
+        if row is None:
+            raise ProfileValidationError(f"{table} 中不存在条目 {entry_id}")
+        if not int(row["retired"]):
+            raise ProfileValidationError(
+                f"{entry_id} 仍是活跃条目：purge 只能清理已退役的条目，请先调 delete"
+            )
+        referencing = self._referencing_skills(entry_id)
+        if referencing and not force:
+            raise ProfileValidationError(
+                f"技能 {', '.join(referencing)} 的证据指向 {entry_id}；"
+                "purge 后引用会真的悬空，确认无误再传 force=True"
+            )
+        self._conn.execute(f"DELETE FROM {table} WHERE {id_field}=?", (entry_id,))
+        self._conn.commit()
+        if referencing:
+            # 行已消失，必须同步从画像剔除引用，并留一次审计（action=entry_purge）
+            profile_row = self._fetch_profile_row()
+            assert profile_row is not None
+            data = _validate(Profile, profile_row["data"]).model_dump()
             data["skills"] = [
                 {**skill, "evidence": [ref for ref in skill["evidence"] if ref != entry_id]}
                 for skill in data["skills"]
             ]
             data["meta"]["updated_at"] = utc_now()
-            self._conn.commit()
-            return self._commit_and_return(Profile.model_validate(data), action="entry_delete")
+            self._commit_and_return(Profile.model_validate(data), action="entry_purge")
+        return referencing
+
+    def _restore_entry(
+        self, table: str, id_field: str, entry_id: str, model_cls: type[Any]
+    ) -> Any | None:
+        with self._lock:
+            row = self._fetch_entry_row(table, id_field, entry_id)
+            if row is None:
+                raise ProfileValidationError(f"{table} 中不存在条目 {entry_id}")
+            if not int(row["retired"]):
+                return _reconcile(_validate(model_cls, row["data"]), id_field, entry_id)
+            self._set_retired(table, id_field, entry_id, retired=False)
+            return _reconcile(_validate(model_cls, row["data"]), id_field, entry_id)
 
     def _commit_and_return(self, profile: Profile, *, action: str) -> Profile:
         self._commit(profile, action=action)
@@ -443,6 +539,17 @@ def _validate(model_cls: type[Any], payload: Any):
 
 def _is_model(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def _reconcile(record: Any, id_field: str, entry_id: str) -> Any:
+    """条目的 id 以数据库主键列为准。
+
+    正常写入下 JSON 与主键必然一致（`_upsert_entry` 先定 id 再落 JSON）；
+    但存量库 / 手工导库可能 JSON 里 id 为空，那样上层会拿到一个无法被 evidence 引用的条目。
+    """
+    if getattr(record, id_field) != entry_id:
+        return record.model_copy(update={id_field: entry_id})
+    return record
 
 
 def _merge(
@@ -488,14 +595,26 @@ __all__ = [
 
 if __name__ == "__main__":
     # 冒烟测试：直接 python -m app.storage.store，全程用临时目录，
-    # 绝不读写 ~/.careersassistant/profile.db
+    # 绝不读写仓库根的 .data/profile.db，也不碰 config.local.toml
+    import os
     import shutil
     import sys
     import tempfile
     from concurrent.futures import ThreadPoolExecutor
 
-    from ..schema import Experience, Outcome, Period, Project
-    from .db import DEFAULT_DB_PATH, SchemaVersionError, connect as _connect
+    from ..schema import Basics, Experience, Outcome, Period, Profile, Project
+    from .db import (
+        DATA_DIR_NAME,
+        DB_PATH_ENV,
+        DEFAULT_DB_PATH,
+        PROJECT_ROOT,
+        SCHEMA_VERSION,
+        SchemaVersionError,
+        StorageConfigError,
+        _ensure_private_dir,
+        connect as _connect,
+        resolve_db_path,
+    )
 
     for _stream in (sys.stdout, sys.stderr):
         if hasattr(_stream, "reconfigure"):
@@ -509,7 +628,7 @@ if __name__ == "__main__":
 
     try:
         store = ProfileStore(_db)
-        print(f"\n默认库路径（本次未使用）：{DEFAULT_DB_PATH}")
+        print(f"\n默认库路径（本次未使用，全程走临时目录）：{DEFAULT_DB_PATH}")
 
         step("1. 首次读取：空画像不应报错")
         bundle = store.load_bundle()
@@ -637,38 +756,86 @@ if __name__ == "__main__":
         except ProfileValidationError as error:
             print(f"回滚不存在的版本已拦截：{str(error)[:70]}")
 
-        step("10. 删除被引用的条目：默认拒绝，force 才连带剔除")
+        step("10. 退役（软删除）：默认拒绝，force 才退，画像与引用一律不动")
         store.upsert_profile(
-            {"skills": [{"name": "Python", "evidence": [exp.exp_id]}, {"name": "架构", "evidence": [proj.proj_id]}]}
+            {
+                "skills": [
+                    {"name": "Python", "evidence": [exp.exp_id]},
+                    {"name": "架构", "evidence": [proj.proj_id]},
+                ]
+            }
         )
+        version_before_retire = store.current_version()
         try:
             store.delete_experience(exp.exp_id)
         except ProfileValidationError as error:
-            print(f"已拦截：{str(error)[:88]}")
+            print(f"已拦截：{str(error)[:96]}")
         else:
-            raise AssertionError("悬空引用未被拦截")
-        after_force = store.delete_experience(exp.exp_id, force=True)
-        assert after_force is not None
-        assert exp.exp_id not in store.load_bundle().entry_ids
-        kept = {tuple(skill.evidence) for skill in store.load_bundle().profile.skills}
-        assert all(exp.exp_id not in refs for refs in kept), kept
-        print(f"force 删除成功，剩余引用已剔除：{sorted(kept)}")
-        # 条目已不存在，再拿它做证据写入必须被拒
-        try:
-            store.upsert_profile({"skills": [{"name": "C", "evidence": [exp.exp_id]}]})
-        except ProfileValidationError as error:
-            print(f"删除后悬空引用已拦截：{str(error)[:70]}")
-        else:
-            raise AssertionError("删除条目后旧证据未被拦截")
+            raise AssertionError("被引用的条目未经裁决就退役了")
+        refs = store.delete_experience(exp.exp_id, force=True)
+        assert refs == ["Python"], refs
+        bundle10 = store.load_bundle()
+        assert exp.exp_id not in bundle10.entry_ids, "退役条目仍对外可见"
+        assert [s.name for s in bundle10.profile.skills] == ["Python", "架构"]
+        assert bundle10.profile.skills[0].evidence == [exp.exp_id], "退役不该剔除画像引用"
+        assert store.current_version() == version_before_retire, "退役不应产生画像版本"
+        issues = store.evidence_issues()
+        assert issues["retired"] == [f"Python → {exp.exp_id}"], issues
+        assert issues["missing"] == [], issues
+        print(f"已退役：引用保留但标为弱信号 → {issues['retired']}")
 
-        step("11. 审计滚动保留")
+        step("11. 退役条目不卡回滚（软删除换来的关键能力）")
+        snapshot = store.snapshot_at(1)
+        assert snapshot is not None and [s.name for s in snapshot.skills] == [
+            "Python",
+            "需求访谈",
+        ]
+        rolled = store.rollback(1)
+        assert exp.exp_id in {ref for s in rolled.skills for ref in s.evidence}
+        print(
+            f"exp 已退役，仍能回到引用它的 v1（内容={len(rolled.skills)} 个技能，"
+            f"新版本 {store.current_version()}）"
+        )
+
+        step("12. purge 才真破坏引用：恢复 / 编辑即复活 / 两步删除")
+        retired_list = store.list_experiences(include_retired=True)
+        assert any(item.exp_id == exp.exp_id for item in retired_list), "退役条目应可用 include_retired 查见"
+        revived = store.upsert_experience(
+            next(item for item in retired_list if item.exp_id == exp.exp_id)
+        )
+        assert exp.exp_id in store.load_bundle().entry_ids, "编辑已退役条目应自动复活"
+        print(f"restore/upsert 均能救回：{revived.company} 重新可见")
+        try:
+            store.delete_project(proj.proj_id, purge=True)
+        except ProfileValidationError as error:
+            print(f"活跃条目直接 purge 被拒：{error}")
+        else:
+            raise AssertionError("purge 的两步约束未生效")
+        store.delete_project(proj.proj_id, force=True)
+        stripped = store.delete_project(proj.proj_id, purge=True, force=True)
+        # 此刻画像是 v1 内容：Python 同时引用 exp 与 proj，需求访谈只引用 exp，
+        # 所以 purge 掉 proj 只影响 Python——这验证了“只剔除真正引用它的技能”
+        assert stripped == ["Python"], stripped
+        assert store.list_projects(include_retired=True) == [], "purge 后行必须真没了"
+        after_purge = store.load_bundle().profile
+        assert all(proj.proj_id not in s.evidence for s in after_purge.skills)
+        assert store.evidence_issues() == {"retired": [], "missing": []}
+        print(f"purge 后引用被剔除（影响 {len(stripped)} 个技能）,版本→{store.current_version()}")
+        try:
+            store.rollback(1)
+        except ProfileValidationError as error:
+            print(f"对比成立：真删（purge）才会卡住回滚：{str(error)[:70]}")
+        else:
+            raise AssertionError("purge 后的回滚应当被拦截")
+
+        step("13. 审计滚动保留")
         for index in range(AUDIT_KEEP + 10):
             store.upsert_profile({"basics": {"location": f"城市{index}"}})
         history = store.history()
         assert len(history) <= AUDIT_KEEP, len(history)
         print(f"写了 {AUDIT_KEEP + 10} 次，历史留 {len(history)} 份，最新一条：{history[0]}")
 
-        step("12. 关库重开：数据必须还在（持久化的唯一验收）")
+        step("14. 关库重开：数据必须还在（持久化的唯一验收）")
         expect = store.load_bundle()
         store.close()
         reopened = ProfileStore(_db)
@@ -678,7 +845,7 @@ if __name__ == "__main__":
         assert got.version == expect.version and got.persisted is True
         print(f"重开读到 version={got.version} projects={len(got.projects)} exps={len(got.experiences)}")
 
-        step("13. 并发写：Agent 线程池 + 前端同时提交不能坏数据")
+        step("15. 并发写：Agent 线程池 + 前端同时提交不能坏数据")
         def worker(index: int) -> None:
             for sub in range(5):
                 reopened.upsert_profile({"basics": {"location": f"W{index}-{sub}"}})
@@ -692,7 +859,7 @@ if __name__ == "__main__":
         print(f"8 线程 × 5 次：version {version_before} → {version_after}，无丢失无错乱")
         reopened.close()
 
-        step("14. 高版本库文件拒绝打开")
+        step("16. 高版本库文件拒绝打开")
         stale = _tmp / "stale.db"
         fresh = _connect(stale)
         fresh.execute("PRAGMA user_version=99")
@@ -705,7 +872,101 @@ if __name__ == "__main__":
         else:
             raise AssertionError("降级打开未被拦截")
 
-        print(f"\n{'=' * 68}\n全部通过：patch 合并 / 证据校验 / 回滚 / 审计 / 并发\n{'=' * 68}")
+        step("17. 存量库（v1，无 retired 列）自动补列且数据不丢")
+        legacy = _tmp / "legacy.db"
+        raw = sqlite3.connect(legacy)
+        raw.executescript(
+            "CREATE TABLE profile (profile_id TEXT PRIMARY KEY, data TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL, version INTEGER NOT NULL);"
+            "CREATE TABLE experience (exp_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, "
+            "data TEXT NOT NULL, updated_at TEXT NOT NULL);"
+            "CREATE TABLE project (proj_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, "
+            "data TEXT NOT NULL, updated_at TEXT NOT NULL);"
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id TEXT, "
+            "version INTEGER, data TEXT, action TEXT, created_at TEXT);"
+        )
+        raw.execute(
+            "INSERT INTO profile VALUES('default', ?, '2026-01-01T00:00:00+00:00', 7)",
+            (Profile(basics=Basics(name="老用户")).model_dump_json(),),
+        )
+        # 故意让 JSON 里的 exp_id 为空，模拟手工导库：读取时以主键列为准
+        raw.execute(
+            "INSERT INTO experience VALUES('exp_old', 'default', ?, '2026-01-01T00:00:00+00:00')",
+            (Experience(company="旧公司", title="旧职位").model_dump_json(),),
+        )
+        raw.execute("PRAGMA user_version=1")
+        raw.commit()
+        raw.close()
+
+        migrated = ProfileStore(legacy)
+        old_bundle = migrated.load_bundle()
+        assert old_bundle.version == 7 and old_bundle.profile.basics.name == "老用户"
+        assert [item.exp_id for item in old_bundle.experiences] == ["exp_old"], "补列后存量行默认未退役，id 以主键列为准"
+        assert old_bundle.experiences[0].company == "旧公司", "补列不能弄丢正文"
+        # 能退役就说明 retired 列真的存在
+        assert migrated.delete_experience("exp_old", force=True) == []
+        assert migrated.load_bundle().experiences == []
+        assert migrated.restore_experience("exp_old") is not None
+        migrated.close()
+        probe = sqlite3.connect(legacy)
+        assert int(probe.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
+        probe.close()
+        print("v1 → v2 补列成功，原有画像与经历完好，软删除可用")
+
+        step("18. 库路径解析优先级：入参 > 环境变量 > 本地配置 > 代码默认")
+        assert DEFAULT_DB_PATH == PROJECT_ROOT / DATA_DIR_NAME / "profile.db"
+        assert DEFAULT_DB_PATH.is_relative_to(PROJECT_ROOT), "默认路径必须由源码位置推导，不受启动目录影响"
+        cfg = _tmp / "config.local.toml"
+        from_config = _tmp / "from-config.db"
+        cfg.write_text(
+            f'[storage]\nprofile_db = "{str(from_config).replace(chr(92), "/")}"\n', encoding="utf-8"
+        )
+        assert resolve_db_path(config_file=cfg) == from_config, "配置文件必须能接管默认路径"
+        from_env = _tmp / "from-env.db"
+        os.environ[DB_PATH_ENV] = str(from_env)
+        try:
+            assert resolve_db_path(config_file=cfg) == from_env, "环境变量要能压过配置文件"
+            assert resolve_db_path(_tmp / "explicit.db", config_file=cfg) == _tmp / "explicit.db"
+        finally:
+            os.environ.pop(DB_PATH_ENV)
+        assert resolve_db_path(config_file=_tmp / "absent.toml") == DEFAULT_DB_PATH, "没配置文件就是默认"
+        print("四级优先级成立；配置文件不存在是正常状态")
+
+        step("19. 坏配置必须报错，不能静默失效")
+        for index, (broken, hint) in enumerate(
+            (
+                ('[storage]\nprofile_dbd = "x.db"\n', "键名拼错"),
+                ('[storage]\nprofile_db = ""\n', "空值"),
+                ('[storage]\nprofile_db = 3\n', "类型错"),
+                ("storage = 1\n", "[storage] 不是表"),
+                ("[storage\n", "TOML 语法错"),
+            ),
+            start=1,
+        ):
+            bad = _tmp / f"bad-{index}.toml"
+            bad.write_text(broken, encoding="utf-8")
+            try:
+                resolve_db_path(config_file=bad)
+            except StorageConfigError as error:
+                # 折成一行：TOML 的原始报错带换行，直接打出来会把分页冲乱
+                brief = " ".join(str(error).split())[:96]
+                print(f"已拦截[{hint}]：{brief}")
+            else:
+                raise AssertionError(f"{hint} 未被拦截")
+
+        step("20. .data 目录自屏蔽：即使外层 .gitignore 被改坏也进不了 git")
+        private = _tmp / "priv"
+        _ensure_private_dir(private)
+        guard = private / ".gitignore"
+        assert guard.read_text(encoding="utf-8") == "*\n", guard.read_text(encoding="utf-8")
+        _ensure_private_dir(private)  # 幂等：已有就不重写
+        assert guard.read_text(encoding="utf-8") == "*\n"
+        print(f"{DATA_DIR_NAME}/ 内会自动生成只含 * 的 .gitignore；真实数据目录：{DEFAULT_DB_PATH.parent}")
+
+        print(
+            f"\n{'=' * 68}\n全部通过：patch 合并 / 证据校验 / 回滚 / 审计 / 并发 / 软删除与两步 purge / "
+            f"补列迁移 / 路径优先级与坏配置 / 目录自屏蔽\n{'=' * 68}"
+        )
     finally:
         shutil.rmtree(_tmp, ignore_errors=True)
         print(f"\n临时目录已清理：{_tmp}")

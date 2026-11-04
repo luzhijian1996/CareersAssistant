@@ -1,0 +1,47 @@
+# CareersAssistant 本地配置模板
+#
+# 用法：把本文件复制成仓库根的 config.local.toml，然后按需取消注释。
+#
+#     copy config.example.toml config.local.toml        (cmd)
+#     Copy-Item config.example.toml config.local.toml   (powershell)
+#
+# config.example.toml 本身提交进仓库（只含注释，不含任何机器相关路径）；
+# config.local.toml 被 .gitignore 屏蔽，是本机专属，程序不会自动创建它。
+#
+# 不确定要不要配？大概率不需要——不配就是用默认路径，一切照常。
+
+
+# ---------------------------------------------------------------- 存储层
+#
+# 库文件路径的解析优先级（从高到低，命中即停）：
+#
+#   1. 显式入参      ProfileStore(db_path=...)
+#   2. 环境变量      CAREERS_PROFILE_DB
+#   3. 本地配置      本文件的 [storage].profile_db
+#   4. 代码默认      <仓库根>/.data/profile.db
+#
+# 也就是说：这一项压不过环境变量。临时换库请用环境变量，不用改文件：
+#
+#     $env:CAREERS_PROFILE_DB = "D:/other/place/profile.db"
+#
+# 本文件适合"我这台机器固定这么放"的长期设置，比如把库指到另一块盘。
+# 生产 / 容器部署不要用第 3 级，务必走第 2 级环境变量：打包后代码里的
+# 仓库根可能是只读目录，而且镜像重建会连数据一起丢掉。
+
+[storage]
+
+# 画像 / 经历 / 项目的 SQLite 库文件位置。
+# 值必须是非空字符串；相对路径会按当前工作目录解析，所以请一律写绝对路径。
+# 反斜杠在 TOML 基本字符串里是转义符，Windows 路径推荐用正斜杠，
+# 或者改用字面量字符串（单引号）：profile_db = 'D:\some\where\profile.db'
+#
+# profile_db = "D:/data/careers/profile.db"
+
+
+# ---------------------------------------------------------------- 关于数据目录
+#
+# 默认路径下的 .data/ 目录里，程序会自动生成一个内容只有 * 的 .gitignore 做自屏蔽。
+# 库文件含姓名、手机号、邮箱等个人信息，且 WAL 模式会额外产生 -wal / -shm 附属文件，
+# 因此 .gitignore 屏蔽的是 .data/ 与 *.db*，而不是单个文件名。
+#
+# 不要把库文件提交进仓库，也不要用 git add -f 绕过屏蔽。

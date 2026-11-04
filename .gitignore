@@ -41,3 +41,10 @@ desktop.ini
 *.log
 *.tmp
 .cache/
+
+# ---- 本地数据与本地配置（含 PII，绝不得入库）.data/ 内另有自屏蔽 .gitignore ----
+.data/
+*.db
+*.db-wal
+*.db-shm
+config.local.toml
