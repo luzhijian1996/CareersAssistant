@@ -113,6 +113,7 @@ class TalkPoints(BaseModel):
 class Derived(BaseModel):
     """派生区：机器算、前端只读。允许落库，但随时可被重算覆盖。"""
 
+    # 资历
     seniority: Seniority = Seniority.UNKNOWN
     domain_tags: list[str] = Field(default_factory=list)
     capability_summary: str = ""
